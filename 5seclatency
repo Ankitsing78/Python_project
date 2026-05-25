@@ -1,0 +1,297 @@
+"""
+Real-Time English → Hindi Speech Translator
+============================================
+Dependencies (install before running):
+    pip install SpeechRecognition deep-translator gTTS pygame tkinter
+    sudo apt-get install portaudio19-dev  # Linux only, for PyAudio
+    pip install pyaudio
+
+How it works:
+  - Listens for 5-second audio chunks in a background thread
+  - Translates captured English text → Hindi via deep-translator (Google)
+  - Speaks the Hindi translation via gTTS + pygame
+  - Displays both input and output text in the GUI pad
+  - While one batch is being translated/spoken, the next batch is already recording
+"""
+
+import threading
+import queue
+import time
+import os
+import tempfile
+import tkinter as tk
+from tkinter import scrolledtext, font as tkfont
+
+import speech_recognition as sr
+from deep_translator import GoogleTranslator
+from gtts import gTTS
+import pygame
+
+
+# ─────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────
+CHUNK_SECONDS = 5          # seconds per listening window
+LANG_INPUT    = "en-US"    # speech recognition language
+LANG_FROM     = "en"       # translation source
+LANG_TO       = "hi"       # translation target
+TTS_LANG      = "hi"       # gTTS language code
+
+
+# ─────────────────────────────────────────────
+# Worker: Listen → Translate → Speak
+# ─────────────────────────────────────────────
+class TranslatorEngine:
+    def __init__(self, gui_callback):
+        self.gui_callback  = gui_callback   # fn(event, text)
+        self.recognizer    = sr.Recognizer()
+        self.translator    = GoogleTranslator(source=LANG_FROM, target=LANG_TO)
+        self._stop_event   = threading.Event()
+        self._listen_thread= None
+        self._work_queue   = queue.Queue()  # carries recognised English text
+        pygame.mixer.init()
+
+    # ── public ──────────────────────────────
+    def start(self):
+        self._stop_event.clear()
+        # Two threads: one keeps listening, one keeps translating+speaking
+        self._listen_thread  = threading.Thread(target=self._listen_loop,  daemon=True)
+        self._process_thread = threading.Thread(target=self._process_loop, daemon=True)
+        self._listen_thread.start()
+        self._process_thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+
+    # ── listening loop ───────────────────────
+    def _listen_loop(self):
+        with sr.Microphone() as source:
+            self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            self.gui_callback("status", "🎙️ Listening…")
+            while not self._stop_event.is_set():
+                try:
+                    audio = self.recognizer.listen(
+                        source,
+                        timeout=1,
+                        phrase_time_limit=CHUNK_SECONDS
+                    )
+                    # offload recognition+translation to process thread
+                    self._work_queue.put(audio)
+                except sr.WaitTimeoutError:
+                    pass   # silence window, just loop
+                except Exception as e:
+                    self.gui_callback("status", f"Mic error: {e}")
+        self.gui_callback("status", "🛑 Stopped listening.")
+
+    # ── processing loop ──────────────────────
+    def _process_loop(self):
+        while not self._stop_event.is_set() or not self._work_queue.empty():
+            try:
+                audio = self._work_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            # Step 1: speech → English text
+            try:
+                english = self.recognizer.recognize_google(audio, language=LANG_INPUT)
+            except sr.UnknownValueError:
+                self.gui_callback("status", "⚠️ Could not understand audio")
+                continue
+            except sr.RequestError as e:
+                self.gui_callback("status", f"Recognition error: {e}")
+                continue
+
+            self.gui_callback("input", english)
+
+            # Step 2: translate
+            try:
+                hindi = self.translator.translate(english)
+            except Exception as e:
+                self.gui_callback("status", f"Translation error: {e}")
+                continue
+
+            self.gui_callback("output", hindi)
+
+            # Step 3: speak
+            self._speak(hindi)
+
+    def _speak(self, text):
+        try:
+            tts = gTTS(text=text, lang=TTS_LANG, slow=False)
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as fp:
+                tmp_path = fp.name
+            tts.save(tmp_path)
+            pygame.mixer.music.load(tmp_path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.1)
+            os.unlink(tmp_path)
+        except Exception as e:
+            self.gui_callback("status", f"TTS error: {e}")
+
+
+# ─────────────────────────────────────────────
+# GUI
+# ─────────────────────────────────────────────
+class TranslatorApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("🗣️ Real-Time English → Hindi Translator")
+        self.configure(bg="#1e1e2e")
+        self.geometry("820x600")
+        self.resizable(True, True)
+
+        self.engine = TranslatorEngine(gui_callback=self._on_engine_event)
+        self._build_ui()
+
+    # ── UI construction ──────────────────────
+    def _build_ui(self):
+        FONT_HEADING = tkfont.Font(family="Helvetica", size=11, weight="bold")
+        FONT_TEXT    = tkfont.Font(family="Helvetica", size=12)
+        FONT_STATUS  = tkfont.Font(family="Helvetica", size=10, slant="italic")
+
+        BG      = "#1e1e2e"
+        PANEL   = "#2a2a3e"
+        ACCENT  = "#7c3aed"
+        GREEN   = "#22c55e"
+        RED     = "#ef4444"
+        FG      = "#e2e8f0"
+        FG_DIM  = "#94a3b8"
+
+        # ── title ─────────────────────────────
+        title_frame = tk.Frame(self, bg=BG)
+        title_frame.pack(fill="x", padx=20, pady=(16, 6))
+        tk.Label(
+            title_frame, text="Real-Time Speech Translator",
+            bg=BG, fg=FG, font=tkfont.Font(family="Helvetica", size=16, weight="bold")
+        ).pack(side="left")
+        tk.Label(
+            title_frame, text="English  →  Hindi",
+            bg=BG, fg=FG_DIM, font=FONT_HEADING
+        ).pack(side="right")
+
+        # ── text pads ─────────────────────────
+        pads_frame = tk.Frame(self, bg=BG)
+        pads_frame.pack(fill="both", expand=True, padx=20, pady=6)
+        pads_frame.columnconfigure(0, weight=1)
+        pads_frame.columnconfigure(1, weight=1)
+        pads_frame.rowconfigure(1, weight=1)
+
+        # Input column
+        tk.Label(
+            pads_frame, text="🎧  Heard (English)",
+            bg=BG, fg=FG_DIM, font=FONT_HEADING, anchor="w"
+        ).grid(row=0, column=0, sticky="w", padx=(0,8))
+
+        self.input_box = scrolledtext.ScrolledText(
+            pads_frame, wrap=tk.WORD, font=FONT_TEXT,
+            bg=PANEL, fg=FG, insertbackground=FG,
+            relief="flat", bd=0, padx=10, pady=10,
+            state="disabled"
+        )
+        self.input_box.grid(row=1, column=0, sticky="nsew", padx=(0,8))
+
+        # Output column
+        tk.Label(
+            pads_frame, text="🔊  Translated (Hindi)",
+            bg=BG, fg=FG_DIM, font=FONT_HEADING, anchor="w"
+        ).grid(row=0, column=1, sticky="w")
+
+        self.output_box = scrolledtext.ScrolledText(
+            pads_frame, wrap=tk.WORD, font=FONT_TEXT,
+            bg=PANEL, fg="#facc15", insertbackground="#facc15",
+            relief="flat", bd=0, padx=10, pady=10,
+            state="disabled"
+        )
+        self.output_box.grid(row=1, column=1, sticky="nsew")
+
+        # ── status bar ────────────────────────
+        self.status_var = tk.StringVar(value="Press  Start Listening  to begin.")
+        status_bar = tk.Label(
+            self, textvariable=self.status_var,
+            bg=PANEL, fg=FG_DIM, font=FONT_STATUS,
+            anchor="w", padx=12, pady=6
+        )
+        status_bar.pack(fill="x", padx=20, pady=(4, 0))
+
+        # ── buttons ───────────────────────────
+        btn_frame = tk.Frame(self, bg=BG)
+        btn_frame.pack(pady=14)
+
+        self.btn_start = tk.Button(
+            btn_frame, text="▶  Start Listening",
+            font=FONT_HEADING, bg=GREEN, fg="#000",
+            activebackground="#16a34a", activeforeground="#000",
+            relief="flat", padx=22, pady=10, cursor="hand2",
+            command=self._start
+        )
+        self.btn_start.pack(side="left", padx=10)
+
+        self.btn_stop = tk.Button(
+            btn_frame, text="⏹  Stop Listening",
+            font=FONT_HEADING, bg=RED, fg="#fff",
+            activebackground="#b91c1c", activeforeground="#fff",
+            relief="flat", padx=22, pady=10, cursor="hand2",
+            state="disabled", command=self._stop
+        )
+        self.btn_stop.pack(side="left", padx=10)
+
+        self.btn_clear = tk.Button(
+            btn_frame, text="🗑  Clear",
+            font=FONT_HEADING, bg=PANEL, fg=FG_DIM,
+            activebackground="#374151", activeforeground=FG,
+            relief="flat", padx=22, pady=10, cursor="hand2",
+            command=self._clear
+        )
+        self.btn_clear.pack(side="left", padx=10)
+
+    # ── button handlers ──────────────────────
+    def _start(self):
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self.status_var.set("🎙️ Starting microphone…")
+        threading.Thread(target=self.engine.start, daemon=True).start()
+
+    def _stop(self):
+        self.btn_stop.config(state="disabled")
+        self.engine.stop()
+        self.btn_start.config(state="normal")
+        self.status_var.set("🛑 Stopped.")
+
+    def _clear(self):
+        for box in (self.input_box, self.output_box):
+            box.config(state="normal")
+            box.delete("1.0", tk.END)
+            box.config(state="disabled")
+
+    # ── engine callback (called from threads) ─
+    def _on_engine_event(self, event, text):
+        # Always dispatch to main thread via `after`
+        self.after(0, self._handle_event, event, text)
+
+    def _handle_event(self, event, text):
+        if event == "input":
+            self._append(self.input_box, f"[EN] {text}\n\n", "#e2e8f0")
+        elif event == "output":
+            self._append(self.output_box, f"[HI] {text}\n\n", "#facc15")
+        elif event == "status":
+            self.status_var.set(text)
+
+    def _append(self, box, text, color=None):
+        box.config(state="normal")
+        start = box.index(tk.END)
+        box.insert(tk.END, text)
+        if color:
+            end = box.index(tk.END)
+            box.tag_add(color, start, end)
+            box.tag_config(color, foreground=color)
+        box.see(tk.END)
+        box.config(state="disabled")
+
+
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    app = TranslatorApp()
+    app.mainloop()
