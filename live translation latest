@@ -1,0 +1,431 @@
+""
+Real-Time English → Hindi Translator  (maximum accuracy + speed edition)
+=========================================================================
+Dependencies:
+    pip install openai-whisper deep-translator pyttsx3 numpy
+    sudo apt-get install -y espeak-ng ffmpeg alsa-utils
+
+Stack:
+  MIC     →  arecord subprocess        (no PyAudio / no segfault)
+  STT     →  OpenAI Whisper (local)    (accurate, offline, no lag)
+  XLATE   →  deep-translator Google    (fast, accurate)
+  TTS     →  espeak-ng hindi voice     (clear, offline, instant)
+  AUDIO   →  espeak-ng subprocess      (no pygame / no segfault)
+"""
+
+import os, ctypes, threading, queue, struct, time, subprocess, tempfile
+import tkinter as tk
+from tkinter import scrolledtext, font as tkfont
+import numpy as np
+
+# silence ALSA stderr
+try:
+    _asound = ctypes.cdll.LoadLibrary("libasound.so.2")
+    _EH = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int,
+                           ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
+    _asound.snd_lib_error_set_handler(_EH(lambda *a: None))
+except Exception:
+    pass
+
+from deep_translator import GoogleTranslator
+import whisper
+
+# ─────────────────────────────────────────────
+# Config  (tweak these to tune feel)
+# ─────────────────────────────────────────────
+SAMPLE_RATE     = 16000   # Whisper expects 16 kHz
+FRAME_MS        = 20      # VAD frame size
+SILENCE_THRESH  = 600     # amplitude → silence boundary
+SILENCE_FRAMES  = 15      # ~300ms of silence = end of phrase
+MIN_SPEECH_FRAMES = 10    # ignore clips shorter than ~200ms
+WHISPER_MODEL   = "base"  # tiny/base/small/medium — base is best speed/accuracy balance
+LANG_FROM       = "en"
+LANG_TO         = "hi"
+
+
+# ─────────────────────────────────────────────
+# VAD Stream — arecord → 20ms frames → phrase
+# ─────────────────────────────────────────────
+class VADStream:
+    def __init__(self):
+        self.frame_bytes  = SAMPLE_RATE * 2 * FRAME_MS // 1000   # 16-bit mono
+        self.thresh       = SILENCE_THRESH
+        self._proc        = None
+        self._stop        = threading.Event()
+
+    def stream(self):
+        self._stop.clear()
+        cmd = ["arecord", "-q", "-f", "S16_LE",
+               "-r", str(SAMPLE_RATE), "-c", "1", "-t", "raw"]
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        buf           = []
+        silent_frames = 0
+        speaking      = False
+
+        while not self._stop.is_set():
+            frame = self._proc.stdout.read(self.frame_bytes)
+            if not frame or len(frame) < self.frame_bytes:
+                break
+
+            amp = self._rms(frame)
+
+            if amp > self.thresh:
+                speaking      = True
+                silent_frames = 0
+                buf.append(frame)
+            elif speaking:
+                buf.append(frame)
+                silent_frames += 1
+                if silent_frames >= SILENCE_FRAMES:
+                    if len(buf) >= MIN_SPEECH_FRAMES:
+                        yield b"".join(buf)
+                    buf           = []
+                    speaking      = False
+                    silent_frames = 0
+
+        if self._proc:
+            try: self._proc.terminate()
+            except: pass
+
+    def stop(self):
+        self._stop.set()
+        if self._proc:
+            try: self._proc.terminate()
+            except: pass
+
+    @staticmethod
+    def _rms(frame):
+        count   = len(frame) // 2
+        samples = struct.unpack(f"{count}h", frame[:count * 2])
+        sq      = sum(s * s for s in samples)
+        return (sq / max(count, 1)) ** 0.5
+
+
+# ─────────────────────────────────────────────
+# TTS — espeak-ng subprocess (clear Hindi voice)
+# ─────────────────────────────────────────────
+class TTSWorker:
+    """
+    Dedicated thread for espeak-ng.
+    espeak-ng -v hi+f3  →  female Hindi voice, much clearer than pyttsx3 default.
+    Adjust -s (speed) and -p (pitch) for natural feel.
+    """
+    def __init__(self):
+        self._q    = queue.Queue()
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def say(self, text):
+        # clear backlog so we don't fall behind in a fast conversation
+        while not self._q.empty():
+            try: self._q.get_nowait()
+            except: pass
+        self._q.put(text)
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                text = self._q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            subprocess.run(
+                ["espeak-ng",
+                 "-v", "hi+f3",   # Hindi female voice variant 3
+                 "-s", "145",      # speed (words/min) — natural pace
+                 "-p", "55",       # pitch (0-99)
+                 "-a", "180",      # amplitude/volume
+                 text],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+
+# ─────────────────────────────────────────────
+# Engine
+# ─────────────────────────────────────────────
+class TranslatorEngine:
+    def __init__(self, gui_callback):
+        self.gui_callback = gui_callback
+        self.translator   = GoogleTranslator(source=LANG_FROM, target=LANG_TO)
+        self.vad          = VADStream()
+        self.tts          = TTSWorker()
+        self._q           = queue.Queue()
+        self._stop        = threading.Event()
+        self._model       = None   # loaded on first start
+
+    def start(self):
+        self._stop.clear()
+        threading.Thread(target=self._load_and_listen, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+        self.vad.stop()
+        self.tts.stop()
+
+    def set_thresh(self, val):
+        self.vad.thresh = int(float(val))
+
+    # ── load Whisper once, then start listening ─────────────────────────────
+    def _load_and_listen(self):
+        if self._model is None:
+            self.gui_callback("status", f"⏳ Loading Whisper '{WHISPER_MODEL}' model…")
+            self._model = whisper.load_model(WHISPER_MODEL)
+            self.gui_callback("status", "✅ Model ready — speak now!")
+
+        # spin up worker pool
+        for _ in range(3):
+            threading.Thread(target=self._worker, daemon=True).start()
+
+        self.gui_callback("indicator", "listening")
+        self.gui_callback("status", "🎙️ Listening…")
+
+        for pcm in self.vad.stream():
+            if self._stop.is_set():
+                break
+            self._q.put(pcm)
+
+        self.gui_callback("indicator", "idle")
+        self.gui_callback("status", "🛑 Stopped.")
+
+    # ── worker: STT → translate → speak ────────────────────────────────────
+    def _worker(self):
+        while not self._stop.is_set() or not self._q.empty():
+            try:
+                pcm = self._q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            # PCM bytes → float32 numpy (Whisper format)
+            audio_np = (np.frombuffer(pcm, dtype=np.int16)
+                          .astype(np.float32) / 32768.0)
+
+            # Whisper transcription
+            try:
+                result  = self._model.transcribe(
+                    audio_np,
+                    language="en",
+                    fp16=False,          # fp16 needs CUDA; CPU = fp32
+                    temperature=0,       # greedy decode = fastest + most consistent
+                    best_of=1,
+                    beam_size=1,         # beam=1 for speed; raise to 5 for accuracy
+                    condition_on_previous_text=False,
+                )
+                english = result["text"].strip()
+            except Exception as e:
+                self.gui_callback("status", f"STT error: {e}")
+                continue
+
+            if not english:
+                continue
+
+            self.gui_callback("input", english)
+
+            # Translate
+            try:
+                hindi = self.translator.translate(english)
+            except Exception as e:
+                self.gui_callback("status", f"Translation error: {e}")
+                continue
+
+            if not hindi:
+                continue
+
+            self.gui_callback("output", hindi)
+            self.tts.say(hindi)
+
+
+# ─────────────────────────────────────────────
+# GUI
+# ─────────────────────────────────────────────
+class TranslatorApp(tk.Tk):
+    BG     = "#0f0f1a"
+    PANEL  = "#1a1a2e"
+    CARD   = "#16213e"
+    ACCENT = "#7c3aed"
+    GREEN  = "#22c55e"
+    RED    = "#ef4444"
+    YELLOW = "#facc15"
+    FG     = "#e2e8f0"
+    DIM    = "#64748b"
+    PULSE  = ["#22c55e", "#16a34a", "#15803d", "#16a34a"]
+
+    def __init__(self):
+        super().__init__()
+        self.title("Real-Time Translator  •  EN → HI  (Whisper)")
+        self.configure(bg=self.BG)
+        self.geometry("920x680")
+        self.resizable(True, True)
+        self.engine     = TranslatorEngine(self._on_event)
+        self._pulse_job = None
+        self._pulse_idx = 0
+        self._build_ui()
+
+    def _build_ui(self):
+        FT = tkfont.Font(family="Helvetica", size=15, weight="bold")
+        FH = tkfont.Font(family="Helvetica", size=10, weight="bold")
+        FS = tkfont.Font(family="Helvetica", size=9,  slant="italic")
+
+        # header
+        h = tk.Frame(self, bg=self.BG)
+        h.pack(fill="x", padx=20, pady=(14, 4))
+        tk.Label(h, text="Conversation Translator", bg=self.BG,
+                 fg=self.FG, font=FT).pack(side="left")
+        tk.Label(h, text="English → हिन्दी  •  Whisper STT",
+                 bg=self.BG, fg=self.ACCENT, font=FH).pack(side="right")
+
+        # status bar
+        bar = tk.Frame(self, bg=self.PANEL, height=36)
+        bar.pack(fill="x", padx=20, pady=(0, 6))
+        bar.pack_propagate(False)
+        self.dot = tk.Label(bar, text="●", bg=self.PANEL,
+                            fg=self.DIM, font=tkfont.Font(size=14))
+        self.dot.pack(side="left", padx=(12, 6))
+        self.status_var = tk.StringVar(value="Press ▶ Start to begin.")
+        tk.Label(bar, textvariable=self.status_var, bg=self.PANEL,
+                 fg=self.DIM, font=FS, anchor="w").pack(
+            side="left", fill="x", expand=True)
+
+        # pads
+        pads = tk.Frame(self, bg=self.BG)
+        pads.pack(fill="both", expand=True, padx=20)
+        pads.columnconfigure(0, weight=1)
+        pads.columnconfigure(1, weight=1)
+        pads.rowconfigure(1, weight=1)
+
+        tk.Label(pads, text="🎧  You said (English)", bg=self.BG,
+                 fg=self.DIM, font=FH, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        tk.Label(pads, text="🔊  Translation (हिन्दी)", bg=self.BG,
+                 fg=self.DIM, font=FH, anchor="w").grid(
+            row=0, column=1, sticky="w", pady=(0, 4))
+
+        self.input_box  = self._pad(pads, self.FG)
+        self.output_box = self._pad(pads, self.YELLOW)
+        self.input_box.grid( row=1, column=0, sticky="nsew", padx=(0, 8))
+        self.output_box.grid(row=1, column=1, sticky="nsew")
+
+        # controls
+        cf = tk.Frame(self, bg=self.PANEL)
+        cf.pack(fill="x", padx=20, pady=(6, 0))
+
+        tk.Label(cf, text="  Mic sensitivity:", bg=self.PANEL,
+                 fg=self.DIM, font=FS).pack(side="left")
+        self._thresh_var = tk.IntVar(value=SILENCE_THRESH)
+        tk.Scale(cf, from_=200, to=1500, resolution=50, orient="horizontal",
+                 variable=self._thresh_var, bg=self.PANEL, fg=self.FG,
+                 highlightthickness=0, troughcolor=self.CARD,
+                 activebackground=self.ACCENT, length=160,
+                 command=lambda v: self.engine.set_thresh(v)
+                 ).pack(side="left", padx=4)
+        tk.Label(cf, text="lower=sensitive", bg=self.PANEL,
+                 fg=self.DIM, font=FS).pack(side="left", padx=(0, 20))
+
+        # model selector
+        tk.Label(cf, text="Whisper model:", bg=self.PANEL,
+                 fg=self.DIM, font=FS).pack(side="left")
+        self._model_var = tk.StringVar(value=WHISPER_MODEL)
+        for m in ("tiny", "base", "small"):
+            tk.Radiobutton(cf, text=m, variable=self._model_var, value=m,
+                           bg=self.PANEL, fg=self.FG, selectcolor=self.CARD,
+                           activebackground=self.PANEL, font=FS).pack(side="left")
+
+        # buttons
+        bf = tk.Frame(self, bg=self.BG)
+        bf.pack(pady=12)
+        self.btn_start = self._btn(bf, "▶  Start Listening",
+                                   self.GREEN, "#000", self._start)
+        self.btn_start.pack(side="left", padx=8)
+        self.btn_stop = self._btn(bf, "⏹  Stop", self.RED, "#fff",
+                                  self._stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=8)
+        self._btn(bf, "🗑  Clear", self.PANEL, self.DIM,
+                  self._clear).pack(side="left", padx=8)
+
+    def _pad(self, parent, fg):
+        return scrolledtext.ScrolledText(
+            parent, wrap=tk.WORD,
+            font=tkfont.Font(family="Helvetica", size=12),
+            bg=self.CARD, fg=fg, insertbackground=fg,
+            relief="flat", bd=0, padx=12, pady=10, state="disabled")
+
+    def _btn(self, parent, text, bg, fg, cmd, state="normal"):
+        return tk.Button(
+            parent, text=text,
+            font=tkfont.Font(family="Helvetica", size=10, weight="bold"),
+            bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
+            relief="flat", padx=20, pady=9, cursor="hand2",
+            state=state, command=cmd)
+
+    def _start(self):
+        import importlib, sys
+        # allow hot-swap of model size before starting
+        global WHISPER_MODEL
+        WHISPER_MODEL = self._model_var.get()
+        self.engine._model = None   # force reload if model changed
+
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self.status_var.set("⏳ Loading model…")
+        threading.Thread(target=self.engine.start, daemon=True).start()
+
+    def _stop(self):
+        self.engine.stop()
+        self.btn_stop.config(state="disabled")
+        self.btn_start.config(state="normal")
+        self._stop_pulse()
+        self.dot.config(fg=self.DIM)
+
+    def _clear(self):
+        for b in (self.input_box, self.output_box):
+            b.config(state="normal")
+            b.delete("1.0", tk.END)
+            b.config(state="disabled")
+
+    def _on_event(self, event, text):
+        self.after(0, self._handle, event, text)
+
+    def _handle(self, event, text):
+        if event == "input":
+            self._append(self.input_box,  f"› {text}\n\n", self.FG)
+        elif event == "output":
+            self._append(self.output_box, f"› {text}\n\n", self.YELLOW)
+        elif event == "status":
+            self.status_var.set(text)
+        elif event == "indicator":
+            if text == "listening":    self._start_pulse()
+            elif text == "processing": self._stop_pulse(); self.dot.config(fg=self.ACCENT)
+            else:                      self._stop_pulse(); self.dot.config(fg=self.DIM)
+
+    def _append(self, box, text, color):
+        box.config(state="normal")
+        i = box.index(tk.END)
+        box.insert(tk.END, text)
+        tag = f"t{color}"
+        box.tag_add(tag, i, box.index(tk.END))
+        box.tag_config(tag, foreground=color)
+        box.see(tk.END)
+        box.config(state="disabled")
+
+    def _start_pulse(self):
+        if not self._pulse_job:
+            self._do_pulse()
+
+    def _do_pulse(self):
+        self.dot.config(fg=self.PULSE[self._pulse_idx % len(self.PULSE)])
+        self._pulse_idx += 1
+        self._pulse_job = self.after(220, self._do_pulse)
+
+    def _stop_pulse(self):
+        if self._pulse_job:
+            self.after_cancel(self._pulse_job)
+            self._pulse_job = None
+
+
+if __name__ == "__main__":
+    app = TranslatorApp()
+    app.mainloop()
